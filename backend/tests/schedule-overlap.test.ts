@@ -3,12 +3,12 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { Pool } from "pg";
 import { randomUUID } from "node:crypto";
 
+import "dotenv/config";
+
 const connectionString = process.env.TEST_DATABASE_URL;
 
 if (!connectionString) {
-  throw new Error(
-    "TEST_DATABASE_URL is required. Set it to the dedicated fielddesk_test database.",
-  );
+  throw new Error("TEST_DATABASE_URL is required; refusing to use DATABASE_URL.");
 }
 
 const pool = new Pool({ connectionString });

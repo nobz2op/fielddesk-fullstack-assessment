@@ -1,7 +1,10 @@
 
 import { Router } from "express";
 import { z } from "zod";
-import { authenticateToken } from "../middleware/auth.middleware.js";
+import {
+  authenticateToken,
+  authorizeRoles,
+} from "../middleware/auth.middleware.js";
 import {
   assignWorkOrder,
   createWorkOrder,
@@ -9,10 +12,23 @@ import {
   findWorkOrderById,
   listWorkOrders,
   updateWorkOrder,
+  enqueueAssignmentNotification,
 } from "../models/work-order.model.js";
 import { listWorkOrderActivities } from "../models/work-order-activity.model.js";
+import { getDashboardCounts } from "../models/dashboard.model.js";
+import { publishRealtimeEvent } from "./realtime.routes.js";
 
 const router = Router();
+
+const workOrderIdSchema = z.string().uuid();
+
+function validateWorkOrderId(id: string): boolean {
+  return workOrderIdSchema.safeParse(id).success;
+}
+
+function getRouteParam(param: string | string[]): string {
+  return Array.isArray(param) ? param[0] : param;
+}
 
 const createWorkOrderSchema = z.object({
   title: z.string().trim().min(3).max(200),
@@ -66,6 +82,14 @@ const updateWorkOrderSchema = z.object({
   },
 );
 
+const technicianUpdateWorkOrderSchema = z.object({
+  status: z.enum([
+    "ASSIGNED",
+    "IN_PROGRESS",
+    "COMPLETED",
+  ]),
+}).strict();
+
 const assignWorkOrderSchema = z.object({
   technicianId: z.string().uuid(),
 }).strict();
@@ -93,6 +117,25 @@ const listWorkOrdersQuerySchema = z.object({
 
 router.use(authenticateToken);
 
+// GET /api/work-orders/dashboard
+router.get("/dashboard", async (req, res, next) => {
+  try {
+    const counts = await getDashboardCounts(
+      req.auth!.organizationId,
+      req.auth!.role === "TECHNICIAN"
+        ? req.auth!.userId
+        : undefined,
+    );
+
+    res.status(200).json({
+      success: true,
+      data: counts,
+    });
+  } catch (error) {
+    next(error);
+  }
+});
+
 // GET /api/work-orders
 router.get("/", async (req, res, next) => {
   try {
@@ -110,9 +153,16 @@ router.get("/", async (req, res, next) => {
       return;
     }
 
+    const options = {
+      ...parsed.data,
+      ...(req.auth!.role === "TECHNICIAN"
+        ? { assignedTechnicianId: req.auth!.userId }
+        : {}),
+    };
+
     const result = await listWorkOrders(
       req.auth!.organizationId,
-      parsed.data,
+      options,
     );
 
     res.status(200).json({
@@ -128,9 +178,22 @@ router.get("/", async (req, res, next) => {
 // GET /api/work-orders/:id/activities
 router.get("/:id/activities", async (req, res, next) => {
   try {
+    const id = getRouteParam(req.params.id);
+
+    if (!validateWorkOrderId(id)) {
+      res.status(400).json({
+        success: false,
+        message: "Invalid work order ID",
+      });
+      return;
+    }
+
     const workOrder = await findWorkOrderById(
-      req.params.id,
+      id,
       req.auth!.organizationId,
+      req.auth!.role === "TECHNICIAN"
+        ? req.auth!.userId
+        : undefined,
     );
 
     if (!workOrder) {
@@ -142,7 +205,7 @@ router.get("/:id/activities", async (req, res, next) => {
     }
 
     const activities = await listWorkOrderActivities(
-      req.params.id,
+      id,
       req.auth!.organizationId,
     );
 
@@ -158,9 +221,22 @@ router.get("/:id/activities", async (req, res, next) => {
 // GET /api/work-orders/:id
 router.get("/:id", async (req, res, next) => {
   try {
+    const id = getRouteParam(req.params.id);
+
+    if (!validateWorkOrderId(id)) {
+      res.status(400).json({
+        success: false,
+        message: "Invalid work order ID",
+      });
+      return;
+    }
+
     const workOrder = await findWorkOrderById(
-      req.params.id,
+      id,
       req.auth!.organizationId,
+      req.auth!.role === "TECHNICIAN"
+        ? req.auth!.userId
+        : undefined,
     );
 
     if (!workOrder) {
@@ -181,8 +257,21 @@ router.get("/:id", async (req, res, next) => {
 });
 
 // PATCH /api/work-orders/:id/assign
-router.patch("/:id/assign", async (req, res, next) => {
+router.patch(
+  "/:id/assign",
+  authorizeRoles("OWNER", "DISPATCHER"),
+  async (req, res, next) => {
   try {
+    const id = getRouteParam(req.params.id);
+
+    if (!validateWorkOrderId(id)) {
+      res.status(400).json({
+        success: false,
+        message: "Invalid work order ID",
+      });
+      return;
+    }
+
     const parsed = assignWorkOrderSchema.safeParse(req.body);
 
     if (!parsed.success) {
@@ -198,7 +287,7 @@ router.patch("/:id/assign", async (req, res, next) => {
     }
 
     const workOrder = await assignWorkOrder(
-      req.params.id,
+      id,
       req.auth!.organizationId,
       parsed.data.technicianId,
       req.auth!.userId,
@@ -213,6 +302,21 @@ router.patch("/:id/assign", async (req, res, next) => {
       return;
     }
 
+    // Enqueue notification job (fire and forget)
+    enqueueAssignmentNotification(
+      id,
+      req.auth!.organizationId,
+      parsed.data.technicianId,
+      workOrder.title,
+    ).catch((error) => {
+      console.error("Failed to enqueue notification:", error);
+    });
+
+    await publishRealtimeEvent({
+      organizationId: req.auth!.organizationId,
+      workOrderId: id,
+      type: "work_order.assigned",
+    });
     res.status(200).json({
       success: true,
       message: "Technician assigned successfully",
@@ -225,12 +329,28 @@ router.patch("/:id/assign", async (req, res, next) => {
 
 router.patch("/:id", async (req, res, next) => {
   try {
-    const parsed = updateWorkOrderSchema.safeParse(req.body);
+    const id = getRouteParam(req.params.id);
+
+    if (!validateWorkOrderId(id)) {
+      res.status(400).json({
+        success: false,
+        message: "Invalid work order ID",
+      });
+      return;
+    }
+
+    const isTechnician = req.auth!.role === "TECHNICIAN";
+
+    const parsed = isTechnician
+      ? technicianUpdateWorkOrderSchema.safeParse(req.body)
+      : updateWorkOrderSchema.safeParse(req.body);
 
     if (!parsed.success) {
       res.status(400).json({
         success: false,
-        message: "Invalid work-order update",
+        message: isTechnician
+          ? "Technicians can update only work-order status"
+          : "Invalid work-order update",
         errors: parsed.error.issues.map((issue) => ({
           field: issue.path.join("."),
           message: issue.message,
@@ -239,11 +359,27 @@ router.patch("/:id", async (req, res, next) => {
       return;
     }
 
+    // Technicians can update only work orders assigned to themselves.
+    const existingWorkOrder = await findWorkOrderById(
+      id,
+      req.auth!.organizationId,
+      isTechnician ? req.auth!.userId : undefined,
+    );
+
+    if (!existingWorkOrder) {
+      res.status(404).json({
+        success: false,
+        message: "Work order not found",
+      });
+      return;
+    }
+
     const workOrder = await updateWorkOrder(
-      req.params.id,
+      id,
       req.auth!.organizationId,
       parsed.data,
       req.auth!.userId,
+      isTechnician ? req.auth!.userId : undefined,
     );
 
     if (!workOrder) {
@@ -254,6 +390,11 @@ router.patch("/:id", async (req, res, next) => {
       return;
     }
 
+    await publishRealtimeEvent({
+      organizationId: req.auth!.organizationId,
+      workOrderId: id,
+      type: "work_order.updated",
+    });
     res.status(200).json({
       success: true,
       data: workOrder,
@@ -264,7 +405,10 @@ router.patch("/:id", async (req, res, next) => {
 });
 
 // POST /api/work-orders
-router.post("/", async (req, res, next) => {
+router.post(
+  "/",
+  authorizeRoles("OWNER", "DISPATCHER"),
+  async (req, res, next) => {
   try {
     const parsed = createWorkOrderSchema.safeParse(req.body);
 
@@ -286,6 +430,12 @@ router.post("/", async (req, res, next) => {
       ...parsed.data,
     });
 
+    await publishRealtimeEvent({
+      organizationId: req.auth!.organizationId,
+      workOrderId: workOrder.id,
+      type: "work_order.created",
+    });
+
     res.status(201).json({
       success: true,
       data: workOrder,
@@ -295,11 +445,25 @@ router.post("/", async (req, res, next) => {
   }
 });
 
-router.delete("/:id", async (req, res, next) => {
+router.delete(
+  "/:id",
+  authorizeRoles("OWNER"),
+  async (req, res, next) => {
   try {
+    const id = getRouteParam(req.params.id);
+
+    if (!validateWorkOrderId(id)) {
+      res.status(400).json({
+        success: false,
+        message: "Invalid work order ID",
+      });
+      return;
+    }
+
     const result = await deleteWorkOrder(
-      req.params.id,
+      id,
       req.auth!.organizationId,
+      req.auth!.userId,
     );
 
     if (!result) {
@@ -310,14 +474,11 @@ router.delete("/:id", async (req, res, next) => {
       return;
     }
 
-    if ("blocked" in result && result.blocked) {
-      res.status(409).json({
-        success: false,
-        message:
-          "Cannot delete this work order because it has activity history",
-      });
-      return;
-    }
+    await publishRealtimeEvent({
+      organizationId: req.auth!.organizationId,
+      workOrderId: id,
+      type: "work_order.deleted",
+    });
 
     res.status(200).json({
       success: true,

@@ -4,6 +4,34 @@ import { authenticateToken } from "../middleware/auth.middleware.js";
 
 const router = Router();
 
+router.get("/technicians", authenticateToken, async (req, res) => {
+  const organizationId = req.auth!.organizationId;
+
+  try {
+    const result = await pool.query(
+      `SELECT id, name, email
+       FROM users
+       WHERE organization_id = $1
+         AND role = 'TECHNICIAN'
+         AND is_active = TRUE
+       ORDER BY name ASC`,
+      [organizationId],
+    );
+
+    return res.status(200).json({
+      success: true,
+      data: result.rows,
+    });
+  } catch (error) {
+    console.error("Failed to retrieve technicians:", error);
+
+    return res.status(500).json({
+      success: false,
+      message: "Failed to retrieve technicians",
+    });
+  }
+});
+
 router.get("/me", authenticateToken, async (req, res) => {
   const organizationId = req.auth!.organizationId;
 

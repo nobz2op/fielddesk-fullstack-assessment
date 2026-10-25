@@ -5,6 +5,7 @@ import {
   checkDatabaseConnection,
   pool,
 } from "./config/database.js";
+import { closeRealtimeStreams } from "./routes/realtime.routes.js";
 
 const PORT = Number(process.env.PORT) || 5000;
 
@@ -18,6 +19,7 @@ async function startServer(): Promise<void> {
 
     function shutdown(signal: string): void {
       console.log(`${signal} received. Shutting down server...`);
+      closeRealtimeStreams();
 
       server.close(async (error) => {
         try {

@@ -33,6 +33,26 @@ services:
       timeout: 3s
       retries: 10
 
+  worker:
+    build:
+      context: ./worker
+      dockerfile: Dockerfile
+    container_name: fielddesk-worker
+    restart: unless-stopped
+    environment:
+      REDIS_URL: redis://redis:6379
+      MOCK_NOTIFICATION_MODE: ${MOCK_NOTIFICATION_MODE:-temporary_once}
+      PGHOST: postgres
+      PGPORT: 5432
+      PGUSER: fielddesk_app
+      PGPASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in the root .env file}
+      PGDATABASE: fielddesk
+    depends_on:
+      redis:
+        condition: service_healthy
+      postgres:
+        condition: service_healthy
+
 volumes:
   postgres_data:
   redis_data:

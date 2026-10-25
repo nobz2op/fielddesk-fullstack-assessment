@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
 import { pool } from "../config/database.js";
+import { enqueueNotification } from "../config/queue.js";
 
 export type WorkOrderPriority = "LOW" | "MEDIUM" | "HIGH" | "URGENT";
 
@@ -91,6 +92,7 @@ export interface ListWorkOrdersOptions {
   sortOrder?: "asc" | "desc";
   page?: number;
   limit?: number;
+  assignedTechnicianId?: string;
 }
 
 export async function listWorkOrders(
@@ -105,10 +107,16 @@ export async function listWorkOrders(
     sortOrder = "desc",
     page = 1,
     limit = 10,
+    assignedTechnicianId,
   } = options;
 
-  const conditions = ["organization_id = $1"];
+  const conditions = ["organization_id = $1", "deleted_at IS NULL"];
   const values: unknown[] = [organizationId];
+
+  if (assignedTechnicianId) {
+    values.push(assignedTechnicianId);
+    conditions.push(`assigned_technician_id = $${values.length}`);
+  }
 
   if (status) {
     values.push(status);
@@ -177,14 +185,24 @@ export async function listWorkOrders(
 export async function findWorkOrderById(
   workOrderId: string,
   organizationId: string,
+  assignedTechnicianId?: string,
 ) {
-  const result = await pool.query(
-    `SELECT *
-     FROM work_orders
-     WHERE id = $1
-       AND organization_id = $2`,
-    [workOrderId, organizationId],
-  );
+  const values: unknown[] = [workOrderId, organizationId];
+
+  let query = `
+    SELECT *
+    FROM work_orders
+    WHERE id = $1
+      AND organization_id = $2
+      AND deleted_at IS NULL
+  `;
+
+  if (assignedTechnicianId) {
+    values.push(assignedTechnicianId);
+    query += ` AND assigned_technician_id = $${values.length}`;
+  }
+
+  const result = await pool.query(query, values);
 
   return result.rows[0] ?? null;
 }
@@ -207,6 +225,7 @@ export async function updateWorkOrder(
   organizationId: string,
   input: UpdateWorkOrderInput,
   actorUserId: string,
+  assignedTechnicianId?: string,
 ) {
   const client = await pool.connect();
 
@@ -229,9 +248,15 @@ export async function updateWorkOrder(
     const existingResult = await client.query(
       `SELECT *
        FROM work_orders
-       WHERE id = $1 AND organization_id = $2
+       WHERE id = $1
+         AND organization_id = $2
+         AND deleted_at IS NULL
+         AND (
+           $3::uuid IS NULL
+           OR assigned_technician_id = $3
+         )
        FOR UPDATE`,
-      [workOrderId, organizationId],
+      [workOrderId, organizationId, assignedTechnicianId ?? null],
     );
 
     const existing = existingResult.rows[0];
@@ -311,6 +336,7 @@ export async function updateWorkOrder(
 export async function deleteWorkOrder(
   workOrderId: string,
   organizationId: string,
+  actorUserId: string,
 ) {
   const client = await pool.connect();
 
@@ -330,25 +356,34 @@ export async function deleteWorkOrder(
       return null;
     }
 
-    const activities = await client.query(
-      `SELECT 1
-       FROM work_order_activities
-       WHERE work_order_id = $1
+    const deleted = await client.query(
+      `UPDATE work_orders
+       SET deleted_at = NOW(), updated_at = NOW()
+       WHERE id = $1
          AND organization_id = $2
-       LIMIT 1`,
+         AND deleted_at IS NULL
+       RETURNING id`,
       [workOrderId, organizationId],
     );
 
-    if (activities.rows.length > 0) {
+    if (deleted.rows.length === 0) {
       await client.query("ROLLBACK");
-      return { blocked: true as const };
+      return null;
     }
 
-    const deleted = await client.query(
-      `DELETE FROM work_orders
-       WHERE id = $1 AND organization_id = $2
-       RETURNING id`,
-      [workOrderId, organizationId],
+    await client.query(
+      `INSERT INTO work_order_activities (
+        id, organization_id, work_order_id,
+        actor_user_id, action, details
+      )
+      VALUES ($1, $2, $3, $4, 'DELETED', $5)`,
+      [
+        randomUUID(),
+        organizationId,
+        workOrderId,
+        actorUserId,
+        JSON.stringify({ deletedAt: new Date().toISOString() }),
+      ],
     );
 
     await client.query("COMMIT");
@@ -382,6 +417,7 @@ export async function assignWorkOrder(
            updated_at = NOW()
        WHERE wo.id = $1
          AND wo.organization_id = $2
+         AND wo.deleted_at IS NULL
          AND EXISTS (
            SELECT 1
            FROM users AS u
@@ -431,5 +467,34 @@ export async function assignWorkOrder(
     throw error;
   } finally {
     client.release();
+  }
+}
+
+// Separate function to enqueue notification after successful assignment
+export async function enqueueAssignmentNotification(
+  workOrderId: string,
+  organizationId: string,
+  technicianId: string,
+  workOrderTitle: string,
+) {
+  try {
+    const technicianResult = await pool.query(
+      `SELECT name, email FROM users WHERE id = $1 AND organization_id = $2`,
+      [technicianId, organizationId],
+    );
+
+    if (technicianResult.rows.length > 0) {
+      const technician = technicianResult.rows[0];
+      await enqueueNotification({
+        workOrderId,
+        organizationId,
+        technicianId,
+        technicianEmail: technician.email,
+        technicianName: technician.name,
+        workOrderTitle,
+      });
+    }
+  } catch (error) {
+    console.error("Failed to enqueue notification:", error);
   }
 }

@@ -7,7 +7,7 @@
     "dev": "tsx watch src/server.ts",
     "build": "tsc",
     "start": "node dist/server.js",
-    "test": "vitest run",
+    "test": "vitest run --maxWorkers=1",
     "test:watch": "vitest",
     "migrate:up": "node-pg-migrate up -m migrations --database-url-var DATABASE_URL --envPath .env --migration-file-language ts",
     "seed": "tsx src/scripts/seed.ts"
